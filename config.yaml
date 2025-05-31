@@ -1,0 +1,23 @@
+# File/Directory Paths
+data_path: ./data
+vector_db_path: ./vector_db
+snapshot_path: ./snapshots
+prompt_path: ./prompts.yaml
+
+# Chunking Params
+chunk:
+  size: 800
+  overlap: 80
+
+# Embedding Model
+embedding:
+  model_name: all-MiniLM-L6-v2
+
+# Local LLM
+llm:
+  local_model_path: ./models/mistral-7b-instruct-v0.1.Q4_K_M.gguf
+  temperature: 0.3
+  top_p: 0.9
+  max_tokens: 400
+  n_ctx: 1536
+  n_threads: 6

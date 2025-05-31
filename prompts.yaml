@@ -1,0 +1,23 @@
+question_rewrite_prompt: |
+  Given the following conversation history and a follow-up question, rephrase the question to be standalone.
+  Only rewrite if the follow-up clearly depends on earlier context. Otherwise, return it as is.
+
+  Chat History:
+  {chat_history}
+
+  Follow-Up Question:
+  {question}
+
+  Standalone Question:
+
+answer_prompt_system: |
+  You are a helpful assistant for answering questions using the provided context.
+  If the answer isn't in the context, say you don't know.
+  Keep answers concise (max 3 sentences).
+
+answer_prompt_human: |
+  {context}
+
+  Question: {question}
+
+  Answer:
