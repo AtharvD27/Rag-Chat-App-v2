@@ -99,9 +99,38 @@ def setup_logging(
     
     return logger
 
-def load_config(config_path="config.yaml"):
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+
+# ===================== UTILITY FUNCTIONS =====================
 
 def compute_sha1(text: str) -> str:
+    """Compute SHA1 hash of text"""
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def ensure_directory(path: Union[str, Path]) -> Path:
+    """Ensure directory exists, create if necessary"""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_file_info(file_path: Union[str, Path]) -> Dict[str, Any]:
+    """Get detailed file information"""
+    path = Path(file_path)
+    stat = path.stat()
+    
+    return {
+        "name": path.name,
+        "size_bytes": stat.st_size,
+        "size_mb": stat.st_size / (1024 * 1024),
+        "created": datetime.fromtimestamp(stat.st_ctime),
+        "modified": datetime.fromtimestamp(stat.st_mtime),
+        "extension": path.suffix,
+        "mime_type": mimetypes.guess_type(str(path))[0]
+    }
+
+
+def batch_iterator(items: List[Any], batch_size: int):
+    """Yield batches of items"""
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
