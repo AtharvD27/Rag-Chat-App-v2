@@ -508,3 +508,92 @@ def apply_env_overrides(config: Dict[str, Any], prefix: str = "RAG_") -> Dict[st
             set_nested(config, key_parts, value)
     
     return config
+
+
+# ===================== PERFORMANCE UTILITIES =====================
+
+class PerformanceMonitor:
+    """Monitor and track performance metrics"""
+    
+    def __init__(self):
+        self.metrics = {}
+        self.start_times = {}
+    
+    def start_timer(self, operation: str):
+        """Start timing an operation"""
+        self.start_times[operation] = time.time()
+    
+    def end_timer(self, operation: str) -> float:
+        """End timing and record metric"""
+        if operation not in self.start_times:
+            return 0.0
+        
+        duration = time.time() - self.start_times[operation]
+        del self.start_times[operation]
+        
+        if operation not in self.metrics:
+            self.metrics[operation] = []
+        self.metrics[operation].append(duration)
+        
+        return duration
+    
+    def get_metrics(self) -> Dict[str, Dict[str, float]]:
+        """Get aggregated metrics"""
+        result = {}
+        for operation, times in self.metrics.items():
+            if times:
+                result[operation] = {
+                    "count": len(times),
+                    "total": sum(times),
+                    "average": sum(times) / len(times),
+                    "min": min(times),
+                    "max": max(times)
+                }
+        return result
+    
+    def get_system_metrics(self) -> Dict[str, Any]:
+        """Get current system metrics"""
+        return {
+            "cpu_percent": psutil.cpu_percent(interval=1),
+            "memory": {
+                "percent": psutil.virtual_memory().percent,
+                "used_gb": psutil.virtual_memory().used / (1024**3),
+                "available_gb": psutil.virtual_memory().available / (1024**3)
+            },
+            "disk": {
+                "percent": psutil.disk_usage('/').percent,
+                "free_gb": psutil.disk_usage('/').free / (1024**3)
+            }
+        }
+
+
+def time_operation(operation_name: Optional[str] = None, logger: Optional[logging.Logger] = None):
+    """
+    Decorator to time function execution
+    
+    Args:
+        operation_name: Name for the operation (defaults to function name)
+        logger: Logger for timing output
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            name = operation_name or func.__name__
+            start_time = time.time()
+            
+            try:
+                result = func(*args, **kwargs)
+                duration = time.time() - start_time
+                
+                if logger:
+                    logger.info(f"{name} completed in {duration:.2f} seconds")
+                
+                return result
+            except Exception as e:
+                duration = time.time() - start_time
+                if logger:
+                    logger.error(f"{name} failed after {duration:.2f} seconds: {str(e)}")
+                raise
+        
+        return wrapper
+    return decorator
