@@ -597,3 +597,12 @@ def time_operation(operation_name: Optional[str] = None, logger: Optional[loggin
         
         return wrapper
     return decorator
+
+
+# ===================== INITIALIZATION =====================
+
+# Global performance monitor instance
+performance_monitor = PerformanceMonitor()
+
+# Configure default logger
+default_logger = setup_logging("rag_chat")
