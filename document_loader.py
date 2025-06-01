@@ -1,49 +1,181 @@
 import os
 import json
+import yaml
+import asyncio
+import aiofiles
+import aiohttp
 import requests
-from utils import compute_sha1
-from bs4 import BeautifulSoup
-from typing import List
+from pathlib import Path
+from typing import List, Dict, Any, Optional, AsyncIterator, Tuple
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from datetime import datetime, timezone
+
+from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm as async_tqdm
+from tqdm import tqdm
 from langchain.docstore.document import Document
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+from utils import (
+    setup_logging, compute_sha1, SecurityValidator, DocumentProcessingError,
+    handle_errors, retry_with_backoff, time_operation, get_file_info,
+    batch_iterator, performance_monitor, ensure_directory
+)
+
+@dataclass
+class LoaderStats:
+    """Statistics for document loading operations"""
+    total_files: int = 0
+    successful_files: int = 0
+    failed_files: int = 0
+    total_size_mb: float = 0.0
+    processing_time: float = 0.0
+    errors: List[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if self.errors is None:
+            self.errors = []
+    
+    @property
+    def success_rate(self) -> float:
+        return (self.successful_files / self.total_files * 100) if self.total_files > 0 else 0
+
 
 class BaseDocumentLoader(ABC):
+    """Base class for all document loaders with async support and batch processing"""
+
     def __init__(self, config_path: str = "config.yaml", config: dict = None):
         self.config = config or self._load_config(config_path)
+
+        # Chunking configuration
         self.chunk_size = self.config.get("chunk", {}).get("size", 800)
         self.chunk_overlap = self.config.get("chunk", {}).get("overlap", 80)
 
-    def _load_config(self, path):
-        with open(path) as f:
-            return yaml.safe_load(f)
+        # Performance configuration
+        perf_config = self.config.get("performance", {})
+        self.batch_size = perf_config.get("batch_size", 100)
+        self.max_concurrent = perf_config.get("max_concurrent_operations", 4)
+        self.enable_async = perf_config.get("enable_async", True)
+
+        # Setup logging
+        log_config = self.config.get("logging", {})
+        self.logger = setup_logging(
+            name=f"rag_chat.{self.__class__.__name__}",
+            log_level=log_config.get("level", "INFO"),
+            log_file=log_config.get("file_path"),
+            console_level=log_config.get("console_level")
+        )
+
+        # Security validator
+        self.security_validator = self.config.get("_security_validator")
+        if not self.security_validator:
+            self.security_validator = SecurityValidator(self.config.get("security", {}))
+        
+        # Statistics tracking
+        self.stats = LoaderStats()
+        
+        self.logger.info(
+            f"Initialized {self.__class__.__name__} with batch_size={self.batch_size}, "
+            f"max_concurrent={self.max_concurrent}, async={self.enable_async}"
+        )
+
+    def _load_config(self, path: str) -> dict:
+            """Load configuration file with error handling"""
+            try:
+                with open(path) as f:
+                    return yaml.safe_load(f)
+            except Exception as e:
+                self.logger = setup_logging("document_loader")
+                self.logger.warning(f"Failed to load config from {path}: {e}. Using defaults.")
+                return {
+                    "chunk": {"size": 800, "overlap": 80},
+                    "logging": {"level": "INFO"},
+                    "performance": {"batch_size": 100, "max_concurrent_operations": 4}
+                }
+
+    @abstractmethod
+    async def load_async(self) -> List[Document]:
+        """Async document loading - must be implemented by subclasses"""
+        pass
 
     @abstractmethod
     def load(self) -> List[Document]:
+        """Sync document loading - must be implemented by subclasses"""
         pass
 
-    def split_documents(self, documents: List[Document]) -> List[Document]:
+    @time_operation("document_splitting")
+    async def split_documents_async(self, documents: List[Document]) -> List[Document]:
+        """Split documents into chunks asynchronously with batch processing"""
+        self.logger.info(f"Splitting {len(documents)} documents into chunks")
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap
         )
-        chunks = splitter.split_documents(documents)
+
+        all_chunks = []
+        
+        # Process in batches to manage memory
+        async for batch_chunks in self._process_batches_async(documents, splitter):
+            all_chunks.extend(batch_chunks)
+        
+        self.logger.info(f"Created {len(all_chunks)} chunks from {len(documents)} documents")
+        return all_chunks
+    
+    async def _process_batches_async(
+        self, 
+        documents: List[Document], 
+        splitter: RecursiveCharacterTextSplitter
+    ) -> AsyncIterator[List[Document]]:
+        
+        """Process documents in batches asynchronously"""
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+            for batch in batch_iterator(documents, self.batch_size):
+                # Process batch in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                batch_chunks = await loop.run_in_executor(
+                    executor,
+                    self._process_batch_sync,
+                    batch,
+                    splitter
+                )
+                yield batch_chunks
+
+    def _process_batch_sync(
+        self, 
+        batch: List[Document], 
+        splitter: RecursiveCharacterTextSplitter
+    ) -> List[Document]:
+        """Process a batch of documents synchronously"""
+        chunks = splitter.split_documents(batch)
         return self.assign_chunk_ids(chunks)
 
     @staticmethod
     def assign_chunk_ids(chunks: List[Document]) -> List[Document]:
+        """Assign unique IDs to chunks with error handling"""
 
-        for doc in chunks:
-            file = os.path.basename(doc.metadata.get("source", "unknown"))
-            page = doc.metadata.get("page", -1)
-            chunk_hash = compute_sha1(f"{file}:{page}:{doc.page_content}")[:20]
-            doc.metadata["file"] = file
-            doc.metadata["page"] = page
-            doc.metadata["chunk"] = chunk_hash
-            doc.metadata["id"] = f"{file}:{page}:{chunk_hash}"
-
+        for idx, doc in enumerate(chunks):
+            try:
+                file = os.path.basename(doc.metadata.get("source", "unknown"))
+                page = doc.metadata.get("page", -1)
+                chunk_hash = compute_sha1(f"{file}:{page}:{doc.page_content}")[:20]
+                
+                doc.metadata.update({
+                    "file": file,
+                    "page": page,
+                    "chunk": chunk_hash,
+                    "id": f"{file}:{page}:{chunk_hash}",
+                    "chunk_index": idx,
+                    "processed_at": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception:
+                # Fallback ID
+                doc.metadata["id"] = f"unknown:{idx}"
+                doc.metadata["chunk_index"] = idx
+        
         return chunks
 
 
