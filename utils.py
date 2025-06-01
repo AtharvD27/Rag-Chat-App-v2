@@ -134,3 +134,108 @@ def batch_iterator(items: List[Any], batch_size: int):
     """Yield batches of items"""
     for i in range(0, len(items), batch_size):
         yield items[i:i + batch_size]
+
+
+# ===================== SECURITY VALIDATION =====================
+
+class SecurityValidator:
+    """Handles all security-related validations"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.allowed_extensions = set(config.get("allowed_file_types", [".pdf", ".txt", ".json", ".html"]))
+        self.max_file_size = config.get("max_file_size_mb", 100) * 1024 * 1024  # Convert to bytes
+        self.allowed_dirs = [Path(d).resolve() for d in config.get("allowed_directories", ["./data"])]
+        self.enable_content_scan = config.get("enable_content_scanning", True)
+        
+        # Initialize magic for file type detection
+        self.mime_detector = magic.Magic(mime=True) if self.enable_content_scan else None
+        
+        # File type to extension mapping
+        self.mime_to_ext = {
+            "application/pdf": ".pdf",
+            "text/plain": ".txt",
+            "application/json": ".json",
+            "text/html": ".html",
+        }
+    
+    def validate_file_path(self, file_path: Union[str, Path]) -> Path:
+        """
+        Validate file path for security issues
+        
+        Args:
+            file_path: Path to validate
+            
+        Returns:
+            Validated Path object
+            
+        Raises:
+            SecurityError: If path validation fails
+        """
+        path = Path(file_path).resolve()
+        
+        # Check if path is within allowed directories
+        if not any(self._is_subdirectory(path, allowed_dir) for allowed_dir in self.allowed_dirs):
+            raise SecurityError(
+                f"Access denied: {path} is outside allowed directories",
+                error_code="PATH_TRAVERSAL",
+                details={"path": str(path), "allowed_dirs": [str(d) for d in self.allowed_dirs]}
+            )
+        
+        # Check if file exists
+        if not path.exists():
+            raise SecurityError(
+                f"File not found: {path}",
+                error_code="FILE_NOT_FOUND",
+                details={"path": str(path)}
+            )
+        
+        # Check file size
+        if path.stat().st_size > self.max_file_size:
+            raise SecurityError(
+                f"File too large: {path} ({path.stat().st_size / 1024 / 1024:.2f}MB)",
+                error_code="FILE_TOO_LARGE",
+                details={
+                    "path": str(path),
+                    "size_mb": path.stat().st_size / 1024 / 1024,
+                    "max_size_mb": self.max_file_size / 1024 / 1024
+                }
+            )
+        
+        # Check file extension
+        if path.suffix.lower() not in self.allowed_extensions:
+            raise SecurityError(
+                f"File type not allowed: {path.suffix}",
+                error_code="INVALID_FILE_TYPE",
+                details={
+                    "path": str(path),
+                    "extension": path.suffix,
+                    "allowed_extensions": list(self.allowed_extensions)
+                }
+            )
+        
+        # Verify file content matches extension
+        if self.enable_content_scan and self.mime_detector:
+            mime_type = self.mime_detector.from_file(str(path))
+            expected_ext = self.mime_to_ext.get(mime_type)
+            if expected_ext and expected_ext != path.suffix.lower():
+                raise SecurityError(
+                    f"File content doesn't match extension: {path}",
+                    error_code="CONTENT_MISMATCH",
+                    details={
+                        "path": str(path),
+                        "detected_type": mime_type,
+                        "expected_extension": expected_ext,
+                        "actual_extension": path.suffix
+                    }
+                )
+        
+        return path
+    
+    @staticmethod
+    def _is_subdirectory(path: Path, directory: Path) -> bool:
+        """Check if path is subdirectory of directory"""
+        try:
+            path.relative_to(directory)
+            return True
+        except ValueError:
+            return False
