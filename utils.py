@@ -100,6 +100,132 @@ def setup_logging(
     return logger
 
 
+# ===================== ERROR HANDLING FRAMEWORK =====================
+
+class RAGException(Exception):
+    """Base exception for RAG application"""
+    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[Dict] = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.details = details or {}
+        self.timestamp = datetime.utcnow()
+
+
+class ConfigurationError(RAGException):
+    """Configuration-related errors"""
+    pass
+
+
+class DocumentProcessingError(RAGException):
+    """Document loading/processing errors"""
+    pass
+
+
+class VectorStoreError(RAGException):
+    """Vectorstore operation errors"""
+    pass
+
+
+class ModelError(RAGException):
+    """LLM-related errors"""
+    pass
+
+
+class SecurityError(RAGException):
+    """Security validation errors"""
+    pass
+
+
+def retry_with_backoff(
+    retries: int = 3,
+    backoff_in_seconds: float = 1.0,
+    exceptions: tuple = (Exception,),
+    logger: Optional[logging.Logger] = None
+) -> Callable:
+    """
+    Decorator for retrying functions with exponential backoff
+    
+    Args:
+        retries: Number of retry attempts
+        backoff_in_seconds: Initial backoff time
+        exceptions: Tuple of exceptions to catch
+        logger: Logger instance for retry logging
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retry_count = 0
+            delay = backoff_in_seconds
+            
+            while retry_count < retries:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    retry_count += 1
+                    if retry_count == retries:
+                        if logger:
+                            logger.error(f"Function {func.__name__} failed after {retries} retries: {str(e)}")
+                        raise
+                    
+                    if logger:
+                        logger.warning(
+                            f"Function {func.__name__} failed (attempt {retry_count}/{retries}): {str(e)}. "
+                            f"Retrying in {delay} seconds..."
+                        )
+                    
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+            
+            return wrapper
+    return decorator
+
+
+def handle_errors(logger: logging.Logger, raise_on_error: bool = True):
+    """
+    Decorator for consistent error handling and logging
+    
+    Args:
+        logger: Logger instance
+        raise_on_error: Whether to re-raise exceptions after logging
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except RAGException as e:
+                logger.error(
+                    f"{func.__name__} failed with {e.__class__.__name__}: {str(e)}",
+                    extra={
+                        "error_code": e.error_code,
+                        "details": e.details,
+                        "function": func.__name__,
+                        "traceback": traceback.format_exc()
+                    }
+                )
+                if raise_on_error:
+                    raise
+                return None
+            except Exception as e:
+                logger.error(
+                    f"{func.__name__} failed with unexpected error: {str(e)}",
+                    extra={
+                        "function": func.__name__,
+                        "error_type": type(e).__name__,
+                        "traceback": traceback.format_exc()
+                    }
+                )
+                if raise_on_error:
+                    raise RAGException(
+                        f"Unexpected error in {func.__name__}: {str(e)}",
+                        error_code="UNEXPECTED_ERROR",
+                        details={"original_error": str(e)}
+                    )
+                return None
+        return wrapper
+    return decorator
+
+
 # ===================== UTILITY FUNCTIONS =====================
 
 def compute_sha1(text: str) -> str:
