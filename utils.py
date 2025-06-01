@@ -365,3 +365,146 @@ class SecurityValidator:
             return True
         except ValueError:
             return False
+        
+
+# ===================== CONFIGURATION MANAGEMENT =====================
+
+@dataclass
+class ConfigSchema:
+    """Configuration schema definition"""
+    required_fields: List[str]
+    optional_fields: Dict[str, Any]  # field_name: default_value
+    
+    def validate(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and fill configuration with defaults"""
+        validated = config.copy()
+        
+        # Check required fields
+        for field in self.required_fields:
+            if field not in validated:
+                raise ConfigurationError(
+                    f"Missing required configuration field: {field}",
+                    error_code="MISSING_FIELD",
+                    details={"field": field, "required_fields": self.required_fields}
+                )
+        
+        # Fill optional fields with defaults
+        for field, default in self.optional_fields.items():
+            if field not in validated:
+                validated[field] = default
+        
+        return validated
+
+
+# Default configuration schema
+DEFAULT_CONFIG_SCHEMA = ConfigSchema(
+    required_fields=["data_path", "vector_db_path"],
+    optional_fields={
+        "snapshot_path": "./snapshots",
+        "prompt_path": "./prompts.yaml",
+        "chunk": {"size": 800, "overlap": 80},
+        "embedding": {"model_name": "all-MiniLM-L6-v2"},
+        "llm": {
+            "temperature": 0.3,
+            "max_tokens": 400,
+            "n_ctx": 1536,
+            "n_threads": 6
+        },
+        "security": {
+            "allowed_file_types": [".pdf", ".txt", ".json", ".html"],
+            "max_file_size_mb": 100,
+            "allowed_directories": ["./data"],
+            "enable_content_scanning": True
+        },
+        "logging": {
+            "level": "INFO",
+            "file_path": "./logs/rag_chat.log",
+            "console_level": "INFO"
+        },
+        "performance": {
+            "batch_size": 100,
+            "max_concurrent_operations": 4,
+            "enable_async": True
+        }
+    }
+)
+
+
+def load_config(
+    config_path: str = "config.yaml",
+    schema: Optional[ConfigSchema] = None,
+    allow_env_override: bool = True
+) -> Dict[str, Any]:
+    """
+    Load and validate configuration with environment variable override support
+    
+    Args:
+        config_path: Path to configuration file
+        schema: Configuration schema for validation
+        allow_env_override: Whether to allow environment variable overrides
+        
+    Returns:
+        Validated configuration dictionary
+    """
+    logger = logging.getLogger("config_loader")
+    
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise ConfigurationError(
+            f"Configuration file not found: {config_path}",
+            error_code="CONFIG_NOT_FOUND",
+            details={"path": config_path}
+        )
+    except yaml.YAMLError as e:
+        raise ConfigurationError(
+            f"Invalid YAML in configuration file: {str(e)}",
+            error_code="INVALID_YAML",
+            details={"path": config_path, "error": str(e)}
+        )
+    
+    # Apply schema validation
+    if schema:
+        config = schema.validate(config)
+    else:
+        config = DEFAULT_CONFIG_SCHEMA.validate(config)
+    
+    # Apply environment variable overrides
+    if allow_env_override:
+        config = apply_env_overrides(config)
+    
+    # Initialize security validator
+    config["_security_validator"] = SecurityValidator(config.get("security", {}))
+    
+    logger.info(f"Configuration loaded successfully from {config_path}")
+    return config
+
+
+def apply_env_overrides(config: Dict[str, Any], prefix: str = "RAG_") -> Dict[str, Any]:
+    """
+    Override configuration values with environment variables
+    
+    Environment variables should be prefixed and use double underscores for nesting
+    Example: RAG_LLM__TEMPERATURE=0.5
+    """
+    def set_nested(d: dict, keys: list, value: Any):
+        """Set nested dictionary value"""
+        for key in keys[:-1]:
+            d = d.setdefault(key.lower(), {})
+        d[keys[-1].lower()] = value
+    
+    for env_key, env_value in os.environ.items():
+        if env_key.startswith(prefix):
+            # Remove prefix and split by double underscore
+            key_parts = env_key[len(prefix):].split("__")
+            
+            # Try to parse value as JSON, fallback to string
+            try:
+                value = json.loads(env_value)
+            except json.JSONDecodeError:
+                value = env_value
+            
+            set_nested(config, key_parts, value)
+    
+    return config
