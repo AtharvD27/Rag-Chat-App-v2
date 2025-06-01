@@ -180,17 +180,155 @@ class BaseDocumentLoader(ABC):
 
 
 class PDFLoader(BaseDocumentLoader):
+    """PDF document loader with async support and memory optimization"""
+    
     def __init__(self, path: str, **kwargs):
         super().__init__(**kwargs)
         self.path = path
 
+    async def load_async(self) -> List[Document]:
+        """Load PDFs asynchronously with progress tracking"""
+        self.logger.info(f"Starting async PDF loading from {self.path}")
+        performance_monitor.start_timer("pdf_loading")
+        
+        try:
+            # Validate directory
+            self.security_validator.validate_file_path(self.path)
+        except Exception as e:
+            self.logger.error(f"Invalid path {self.path}: {e}")
+            raise DocumentProcessingError(
+                f"Invalid document path: {self.path}",
+                error_code="INVALID_PATH",
+                details={"path": self.path, "error": str(e)}
+            )
+        
+        # Get all PDF files
+        pdf_files = [f for f in os.listdir(self.path) if f.endswith(".pdf")]
+        self.stats.total_files = len(pdf_files)
+        
+        if not pdf_files:
+            self.logger.warning(f"No PDF files found in {self.path}")
+            return []
+        
+        # Process PDFs concurrently
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        
+        async def process_pdf(file: str) -> Optional[List[Document]]:
+            async with semaphore:
+                return await self._load_single_pdf_async(os.path.join(self.path, file))
+        
+        # Process with progress bar
+        tasks = [process_pdf(file) for file in pdf_files]
+        results = []
+        
+        with tqdm(total=len(pdf_files), desc="Loading PDFs") as pbar:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                if result:
+                    results.extend(result)
+                pbar.update(1)
+        
+        # Flatten results
+        all_docs = []
+        for docs in results:
+            if docs:
+                all_docs.extend(docs)
+        
+        # Update statistics
+        self.stats.processing_time = performance_monitor.end_timer("pdf_loading")
+        self.stats.successful_files = len([r for r in results if r])
+        self.stats.failed_files = self.stats.total_files - self.stats.successful_files
+        
+        self._log_statistics()
+        return all_docs
+
+    async def _load_single_pdf_async(self, file_path: str) -> Optional[List[Document]]:
+        """Load a single PDF file asynchronously"""
+        try:
+            # Validate file
+            self.security_validator.validate_file_path(file_path)
+            file_info = get_file_info(file_path)
+            
+            self.logger.debug(f"Processing PDF: {file_path} ({file_info['size_mb']:.2f}MB)")
+            
+            # Run PDF loading in thread pool (PyPDFLoader is not async)
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                docs = await loop.run_in_executor(
+                    executor,
+                    self._load_pdf_sync,
+                    file_path
+                )
+            
+            # Add metadata
+            for doc in docs:
+                doc.metadata.update({
+                    "loader": "PDFLoader",
+                    "file_size_mb": file_info['size_mb'],
+                    "load_timestamp": datetime.utcnow().isoformat()
+                })
+            
+            self.stats.total_size_mb += file_info['size_mb']
+            return docs
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load PDF {file_path}: {e}")
+            self.stats.errors.append({
+                "file": file_path,
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            return None
+
+    def _load_pdf_sync(self, file_path: str) -> List[Document]:
+        """Synchronous PDF loading"""
+        loader = PyPDFLoader(file_path)
+        return loader.load()
+
     def load(self) -> List[Document]:
+        """Synchronous loading interface"""
+        if self.enable_async:
+            return asyncio.run(self.load_async())
+        else:
+            return self._load_sync()
+
+    def _load_sync(self) -> List[Document]:
+        """Traditional synchronous loading"""
+        self.logger.info(f"Loading PDFs from {self.path}")
         docs = []
-        for file in os.listdir(self.path):
-            if file.endswith(".pdf"):
-                loader = PyPDFLoader(os.path.join(self.path, file))
-                docs.extend(loader.load())
+        
+        try:
+            self.security_validator.validate_file_path(self.path)
+        except Exception as e:
+            self.logger.error(f"Invalid path {self.path}: {e}")
+            raise
+        
+        pdf_files = [f for f in os.listdir(self.path) if f.endswith(".pdf")]
+        
+        for file in tqdm(pdf_files, desc="Loading PDFs"):
+            file_path = os.path.join(self.path, file)
+            try:
+                result = self._load_single_pdf_async(file_path)
+                if asyncio.iscoroutine(result):
+                    result = asyncio.run(result)
+                if result:
+                    docs.extend(result)
+            except Exception as e:
+                self.logger.error(f"Failed to load {file}: {e}")
+        
         return docs
+
+    def _log_statistics(self):
+        """Log loading statistics"""
+        self.logger.info(
+            f"PDF Loading Complete:\n"
+            f"  - Total files: {self.stats.total_files}\n"
+            f"  - Successful: {self.stats.successful_files}\n"
+            f"  - Failed: {self.stats.failed_files}\n"
+            f"  - Total size: {self.stats.total_size_mb:.2f}MB\n"
+            f"  - Processing time: {self.stats.processing_time:.2f}s\n"
+            f"  - Success rate: {self.stats.success_rate:.1f}%"
+        )
 
 
 class JSONLoader(BaseDocumentLoader):
