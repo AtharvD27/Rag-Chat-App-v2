@@ -838,4 +838,48 @@ class SmartDocumentLoader(BaseDocumentLoader):
             f"  Available memory: {system_metrics['memory']['available_gb']:.2f}GB\n"
             f"{'='*60}"
         )
+       
+        
+# Example usage demonstrating new features
+if __name__ == "__main__":
+    import argparse
+    from utils import load_config
+    
+    parser = argparse.ArgumentParser(description="Test document loading with async support")
+    parser.add_argument("--async", action="store_true", help="Use async loading")
+    parser.add_argument("--config", default="config.yaml", help="Config file path")
+    parser.add_argument("--path", help="Override data path")
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Override settings if specified
+    if args.path:
+        config["data_path"] = args.path
+    if args.async:
+        config["performance"]["enable_async"] = True
+    
+    # Create loader
+    loader = SmartDocumentLoader(config=config)
+    
+    try:
+        # Load documents
+        print("Starting document loading...")
+        documents = loader.load()
+        print(f"\nSuccessfully loaded {len(documents)} documents")
+        
+        # Test chunking
+        print("\nTesting document chunking...")
+        chunks = loader.split_documents(documents[:5])  # Test with first 5 docs
+        print(f"Created {len(chunks)} chunks from {min(5, len(documents))} documents")
+        
+        # Show sample chunk
+        if chunks:
+            print(f"\nSample chunk metadata: {chunks[0].metadata}")
+        
+    except Exception as e:
+        print(f"Error during loading: {e}")
+        import traceback
+        traceback.print_exc()
 
