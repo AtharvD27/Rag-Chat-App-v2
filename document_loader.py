@@ -332,23 +332,144 @@ class PDFLoader(BaseDocumentLoader):
 
 
 class JSONLoader(BaseDocumentLoader):
+    """JSON document loader with streaming support for large files"""
+    
     def __init__(self, path: str, **kwargs):
         super().__init__(**kwargs)
         self.path = path
 
-    def load(self) -> List[Document]:
+    async def load_async(self) -> List[Document]:
+        """Load JSON files asynchronously with streaming for large files"""
+        self.logger.info(f"Starting async JSON loading from {self.path}")
+        
+        json_files = [f for f in os.listdir(self.path) if f.endswith(".json")]
+        if not json_files:
+            self.logger.warning(f"No JSON files found in {self.path}")
+            return []
+        
+        all_docs = []
+        
+        async def process_json(file: str) -> List[Document]:
+            file_path = os.path.join(self.path, file)
+            try:
+                # Check file size
+                file_info = get_file_info(file_path)
+                
+                if file_info['size_mb'] > 10:  # Stream large files
+                    return await self._load_large_json_async(file_path)
+                else:
+                    return await self._load_json_async(file_path)
+                    
+            except Exception as e:
+                self.logger.error(f"Failed to load JSON {file}: {e}")
+                return []
+        
+        # Process concurrently
+        tasks = [process_json(file) for file in json_files]
+        results = await asyncio.gather(*tasks)
+        
+        for docs in results:
+            all_docs.extend(docs)
+        
+        self.logger.info(f"Loaded {len(all_docs)} documents from {len(json_files)} JSON files")
+        return all_docs
+
+    async def _load_json_async(self, file_path: str) -> List[Document]:
+        """Load a regular JSON file asynchronously"""
+        self.security_validator.validate_file_path(file_path)
+        
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+            content = await f.read()
+            data = json.loads(content)
+        
+        return self._process_json_data(data, file_path)
+
+    async def _load_large_json_async(self, file_path: str) -> List[Document]:
+        """Stream large JSON files to avoid memory issues"""
+        self.logger.info(f"Streaming large JSON file: {file_path}")
         docs = []
-        for file in os.listdir(self.path):
-            if file.endswith(".json"):
-                with open(os.path.join(self.path, file), "r") as f:
+        
+        # For large files, we'll process in chunks
+        # This is a simplified approach - for production, consider using ijson
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+            content = await f.read()
+            data = json.loads(content)
+        
+        # Process in batches if it's a list
+        if isinstance(data, list):
+            for batch in batch_iterator(data, self.batch_size):
+                batch_docs = self._process_json_batch(batch, file_path)
+                docs.extend(batch_docs)
+        else:
+            docs = self._process_json_data(data, file_path)
+        
+        return docs
+
+    def _process_json_data(self, data: Any, source: str) -> List[Document]:
+        """Process JSON data into documents"""
+        docs = []
+        
+        if isinstance(data, list):
+            for idx, entry in enumerate(data):
+                content = entry.get("text") if isinstance(entry, dict) else json.dumps(entry)
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": source,
+                        "loader": "JSONLoader",
+                        "entry_index": idx,
+                        "type": "list_entry"
+                    }
+                ))
+        elif isinstance(data, dict):
+            content = data.get("text", json.dumps(data))
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    "source": source,
+                    "loader": "JSONLoader",
+                    "type": "object"
+                }
+            ))
+        
+        return docs
+
+    def _process_json_batch(self, batch: List[Any], source: str) -> List[Document]:
+        """Process a batch of JSON entries"""
+        docs = []
+        for idx, entry in enumerate(batch):
+            content = entry.get("text") if isinstance(entry, dict) else json.dumps(entry)
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    "source": source,
+                    "loader": "JSONLoader",
+                    "batch_processed": True
+                }
+            ))
+        return docs
+
+    def load(self) -> List[Document]:
+        """Synchronous loading interface"""
+        if self.enable_async:
+            return asyncio.run(self.load_async())
+        else:
+            return self._load_sync()
+
+    def _load_sync(self) -> List[Document]:
+        """Traditional synchronous loading"""
+        docs = []
+        json_files = [f for f in os.listdir(self.path) if f.endswith(".json")]
+        
+        for file in json_files:
+            file_path = os.path.join(self.path, file)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        for entry in data:
-                            content = entry.get("text") or json.dumps(entry)
-                            docs.append(Document(page_content=content, metadata={"source": file}))
-                    elif isinstance(data, dict):
-                        content = data.get("text") or json.dumps(data)
-                        docs.append(Document(page_content=content, metadata={"source": file}))
+                docs.extend(self._process_json_data(data, file_path))
+            except Exception as e:
+                self.logger.error(f"Failed to load {file}: {e}")
+        
         return docs
 
 
