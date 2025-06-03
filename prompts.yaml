@@ -1,23 +1,263 @@
-question_rewrite_prompt: |
-  Given the following conversation history and a follow-up question, rephrase the question to be standalone.
-  Only rewrite if the follow-up clearly depends on earlier context. Otherwise, return it as is.
+# Enhanced Prompts for RAG Chat Application v2.0
+# These prompts are optimized for better retrieval and generation
 
-  Chat History:
-  {chat_history}
+# ============================================
+# CORE PROMPTS
+# ============================================
 
-  Follow-Up Question:
-  {question}
-
-  Standalone Question:
-
+# System prompt for answer generation
 answer_prompt_system: |
-  You are a helpful assistant for answering questions using the provided context.
-  If the answer isn't in the context, say you don't know.
-  Keep answers concise (max 3 sentences).
+  You are an intelligent assistant with access to a knowledge base. Your role is to provide accurate, helpful, and concise answers based on the provided context.
+  
+  Guidelines:
+  - Answer based ONLY on the provided context
+  - If the context doesn't contain enough information, clearly state what's missing
+  - Be concise but complete - aim for 2-4 sentences unless more detail is specifically requested
+  - Maintain a professional yet friendly tone
+  - If multiple perspectives exist in the context, acknowledge them
+  - Never make up information not present in the context
 
+# Human prompt template for Q&A
 answer_prompt_human: |
+  Context Information:
   {context}
-
+  
   Question: {question}
-
+  
+  Please provide a clear and accurate answer based on the context above. If the context doesn't fully answer the question, explain what information is available and what might be missing.
+  
   Answer:
+
+# ============================================
+# QUERY ENHANCEMENT PROMPTS
+# ============================================
+
+# Prompt for query expansion (used internally)
+query_expansion_prompt: |
+  Given the following user question, generate 2-3 related search terms or synonyms that would help find relevant information. Focus on key concepts and alternative phrasings.
+  
+  Original question: {question}
+  
+  Related search terms:
+
+# Prompt for query clarification
+query_clarification_prompt: |
+  The following question seems ambiguous or unclear. Please suggest a clarification question to better understand what the user is looking for.
+  
+  User question: {question}
+  Context: {chat_history}
+  
+  Clarification question:
+
+# ============================================
+# CONVERSATION PROMPTS
+# ============================================
+
+# Prompt for conversation summarization
+conversation_summary_prompt: |
+  Please provide a concise summary of the following conversation between a human and an AI assistant. Focus on:
+  - Main topics discussed
+  - Key questions asked
+  - Important information provided
+  - Any unresolved questions or follow-ups needed
+  
+  Conversation:
+  {conversation}
+  
+  Summary (max 200 words):
+
+# Prompt for follow-up question generation
+follow_up_prompt: |
+  Based on this conversation, suggest 2-3 relevant follow-up questions the user might be interested in:
+  
+  Recent exchange:
+  Human: {last_question}
+  Assistant: {last_answer}
+  
+  Suggested follow-up questions:
+
+# ============================================
+# SPECIALIZED PROMPTS BY QUERY TYPE
+# ============================================
+
+# For factual questions (what, when, where, who)
+factual_prompt_system: |
+  You are a precise information assistant. For factual questions, provide:
+  - Direct, specific answers
+  - Relevant dates, numbers, or names from the context
+  - Source references when available
+  - Brief additional context only if it clarifies the answer
+
+# For analytical questions (why, how, analyze, explain)
+analytical_prompt_system: |
+  You are an analytical assistant. For analytical questions:
+  - Provide comprehensive explanations
+  - Break down complex concepts into understandable parts
+  - Use examples from the context when available
+  - Present multiple viewpoints if they exist in the context
+  - Structure your response logically
+
+# For instructional questions (how to, steps, guide)
+instructional_prompt_system: |
+  You are a helpful instructor. For how-to questions:
+  - Provide clear, step-by-step instructions
+  - Number or bullet point each step
+  - Include any prerequisites or warnings
+  - Mention alternative approaches if available in the context
+  - Keep instructions practical and actionable
+
+# For definition questions (what is, define, meaning of)
+definition_prompt_system: |
+  You are a knowledgeable reference assistant. For definitions:
+  - Start with a clear, concise definition
+  - Provide context or examples if available
+  - Mention related concepts from the context
+  - Keep technical jargon minimal unless necessary
+
+# ============================================
+# ERROR HANDLING PROMPTS
+# ============================================
+
+# When no relevant context is found
+no_context_response: |
+  I don't have enough information in my current knowledge base to answer your question about "{question}". 
+  
+  To help you better, I would need information about:
+  {missing_info}
+  
+  You might try rephrasing your question or providing more context.
+
+# When context is partially relevant
+partial_context_response: |
+  Based on the available information, I can partially address your question about "{question}".
+  
+  Here's what I found:
+  {partial_answer}
+  
+  However, I don't have complete information about:
+  {missing_aspects}
+
+# When query is too vague
+vague_query_response: |
+  Your question is quite broad. To provide a more helpful answer, could you please specify:
+  {clarification_suggestions}
+  
+  This will help me find the most relevant information for you.
+
+# ============================================
+# RETRIEVAL OPTIMIZATION PROMPTS
+# ============================================
+
+# For hybrid search query generation
+hybrid_search_prompt: |
+  Extract key search terms from this question for both semantic and keyword search:
+  
+  Question: {question}
+  
+  Semantic concepts (abstract ideas, meanings):
+  Keywords (specific terms, names, acronyms):
+
+# For reranking context
+rerank_context_prompt: |
+  Score the relevance of this text passage to the question on a scale of 1-10:
+  
+  Question: {question}
+  Passage: {passage}
+  
+  Relevance score and brief reason:
+
+# ============================================
+# MULTI-TURN CONVERSATION PROMPTS
+# ============================================
+
+# For maintaining context across turns
+context_carry_prompt: |
+  Previous context summary: {summary}
+  
+  New question: {question}
+  
+  Considering the previous context, interpret and answer the new question:
+
+# For reference resolution
+reference_resolution_prompt: |
+  In the context of this conversation:
+  {recent_history}
+  
+  The user said: "{question}"
+  
+  Resolve any pronouns or references to previous topics:
+
+# ============================================
+# CITATION AND SOURCE PROMPTS
+# ============================================
+
+# For adding citations to answers
+citation_prompt: |
+  Add appropriate citations to this answer using the provided source information:
+  
+  Answer: {answer}
+  
+  Sources:
+  {sources}
+  
+  Rewrite with inline citations [1], [2], etc.:
+
+# For source quality assessment
+source_quality_prompt: |
+  Evaluate the reliability and relevance of this source for answering the question:
+  
+  Question: {question}
+  Source: {source}
+  
+  Quality assessment (reliability, relevance, recency):
+
+# ============================================
+# SAFETY AND MODERATION PROMPTS
+# ============================================
+
+# For sensitive content handling
+sensitive_content_prompt: |
+  The following question may involve sensitive content. Provide a helpful response while:
+  - Maintaining appropriate boundaries
+  - Focusing on factual, educational information
+  - Avoiding harmful or inappropriate content
+  
+  Question: {question}
+  Context: {context}
+
+# For refusing inappropriate requests
+refusal_prompt: |
+  I understand you're asking about {topic}, but I'm not able to provide {specific_request} because {reason}.
+  
+  Instead, I can offer:
+  {alternatives}
+
+# ============================================
+# DEBUGGING AND TESTING PROMPTS
+# ============================================
+
+# For testing retrieval quality
+retrieval_test_prompt: |
+  Evaluate whether this retrieved context adequately answers the question:
+  
+  Question: {question}
+  Retrieved context: {context}
+  
+  Assessment:
+  - Relevance (1-10):
+  - Completeness (1-10):
+  - Missing information:
+
+# For testing answer quality
+answer_quality_prompt: |
+  Rate this answer for:
+  
+  Question: {question}
+  Answer: {answer}
+  
+  - Accuracy (based on context): /10
+  - Clarity: /10
+  - Completeness: /10
+  - Conciseness: /10
+  
+  Suggestions for improvement:
