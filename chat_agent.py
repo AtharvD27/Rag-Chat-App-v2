@@ -59,6 +59,376 @@ class QueryAnalysis:
             self.expansion_terms = []
 
 
+class HybridRetriever(BaseRetriever):
+    """Custom hybrid retriever combining semantic and keyword search"""
+    
+    def __init__(
+        self,
+        vectorstore_retriever: VectorStoreRetriever,
+        documents: List[Document],
+        config: Dict[str, Any],
+        logger=None
+    ):
+        self.vectorstore_retriever = vectorstore_retriever
+        self.documents = documents
+        self.config = config
+        
+        # Retrieval configuration
+        retrieval_config = config.get("retrieval", {})
+        self.search_type = retrieval_config.get("search_type", "hybrid")
+        self.semantic_weight = retrieval_config.get("semantic_weight", 0.7)
+        self.keyword_weight = retrieval_config.get("keyword_weight", 0.3)
+        self.top_k = retrieval_config.get("top_k", 5)
+        self.rerank = retrieval_config.get("rerank", True)
+        self.diversity_threshold = retrieval_config.get("diversity_threshold", 0.7)
+        
+        # Setup logging
+        self.logger = logger or setup_logging("rag_chat.HybridRetriever")
+        
+        # Initialize keyword retriever (BM25)
+        if self.search_type in ["hybrid", "keyword"]:
+            self.keyword_retriever = BM25Retriever.from_documents(
+                documents, 
+                k=self.top_k * 2  # Get more candidates for reranking
+            )
+            self.logger.info("Initialized BM25 keyword retriever")
+        
+        # Cache for query analysis
+        self.query_cache = {}
+        
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """Main retrieval method"""
+        return self.retrieve(query)
+    
+    @time_operation("hybrid_retrieval")
+    def retrieve(self, query: str) -> List[Document]:
+        """Perform hybrid retrieval with advanced features"""
+        try:
+            # Analyze query
+            query_analysis = self._analyze_query(query)
+            self.logger.debug(f"Query analysis: {query_analysis}")
+            
+            # Get candidates from different retrievers
+            if self.search_type == "semantic":
+                results = self._semantic_search(query_analysis)
+            elif self.search_type == "keyword":
+                results = self._keyword_search(query_analysis)
+            else:  # hybrid
+                results = self._hybrid_search(query_analysis)
+            
+            # Apply reranking if enabled
+            if self.rerank and len(results.documents) > 0:
+                results = self._rerank_results(results, query_analysis)
+            
+            # Apply diversity filtering
+            if self.diversity_threshold < 1.0:
+                results = self._apply_diversity_filter(results)
+            
+            # Log retrieval metrics
+            self._log_retrieval_metrics(query, results)
+            
+            return results.documents[:self.top_k]
+            
+        except Exception as e:
+            self.logger.error(f"Retrieval failed for query '{query}': {e}")
+            # Fallback to simple semantic search
+            return self.vectorstore_retriever.get_relevant_documents(query)
+    
+    def _analyze_query(self, query: str) -> QueryAnalysis:
+        """Analyze query to optimize retrieval strategy"""
+        # Check cache
+        if query in self.query_cache:
+            return self.query_cache[query]
+        
+        # Clean query
+        cleaned = query.strip().lower()
+        
+        # Extract entities (simple regex-based for now)
+        entities = []
+        # Look for capitalized words (potential entities)
+        entity_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
+        entities = re.findall(entity_pattern, query)
+        
+        # Extract keywords (important terms)
+        # Remove common words
+        stop_words = {"the", "is", "at", "which", "on", "a", "an", "and", "or", "but", "in", "with", "to", "for"}
+        words = [w for w in cleaned.split() if w not in stop_words and len(w) > 2]
+        keywords = words[:5]  # Top 5 keywords
+        
+        # Detect query type
+        query_type = self._classify_query_type(cleaned)
+        
+        # Detect temporal context
+        temporal_context = None
+        temporal_patterns = [
+            (r'\b(today|yesterday|tomorrow)\b', "relative"),
+            (r'\b(this|last|next)\s+(week|month|year)\b', "relative"),
+            (r'\b\d{4}\b', "absolute"),
+            (r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', "absolute")
+        ]
+        
+        for pattern, context_type in temporal_patterns:
+            if re.search(pattern, cleaned):
+                temporal_context = context_type
+                break
+        
+        # Generate expansion terms
+        expansion_terms = self._generate_expansion_terms(keywords)
+        
+        analysis = QueryAnalysis(
+            original_query=query,
+            cleaned_query=cleaned,
+            query_type=query_type,
+            entities=entities,
+            keywords=keywords,
+            temporal_context=temporal_context,
+            expansion_terms=expansion_terms
+        )
+        
+        # Cache the analysis
+        self.query_cache[query] = analysis
+        
+        return analysis
+    
+    def _classify_query_type(self, query: str) -> str:
+        """Classify the type of query"""
+        query_lower = query.lower()
+        
+        # Factual questions
+        if any(word in query_lower for word in ["what", "when", "where", "who", "which", "how many", "how much"]):
+            return "factual"
+        
+        # Analytical questions
+        if any(word in query_lower for word in ["why", "how", "analyze", "explain", "compare", "evaluate"]):
+            return "analytical"
+        
+        # Definition questions
+        if any(phrase in query_lower for phrase in ["what is", "what are", "define", "meaning of"]):
+            return "definition"
+        
+        # Instructional questions
+        if any(word in query_lower for word in ["how to", "steps", "guide", "tutorial", "instruction"]):
+            return "instructional"
+        
+        return "general"
+    
+    def _generate_expansion_terms(self, keywords: List[str]) -> List[str]:
+        """Generate query expansion terms"""
+        expansions = []
+        
+        # Simple synonym expansion (in production, use WordNet or similar)
+        synonym_map = {
+            "create": ["make", "build", "construct", "develop"],
+            "delete": ["remove", "erase", "clear", "destroy"],
+            "update": ["modify", "change", "edit", "revise"],
+            "error": ["bug", "issue", "problem", "fault"],
+            "fast": ["quick", "rapid", "speed", "performance"],
+        }
+        
+        for keyword in keywords:
+            if keyword in synonym_map:
+                expansions.extend(synonym_map[keyword][:2])  # Add top 2 synonyms
+        
+        return expansions
+    
+    def _semantic_search(self, query_analysis: QueryAnalysis) -> RetrievalResult:
+        """Perform semantic search"""
+        # Use expanded query if available
+        search_query = query_analysis.original_query
+        if query_analysis.expansion_terms:
+            search_query = f"{search_query} {' '.join(query_analysis.expansion_terms[:2])}"
+        
+        docs = self.vectorstore_retriever.get_relevant_documents(search_query)
+        
+        # Extract scores if available
+        scores = [doc.metadata.get("score", 1.0) for doc in docs]
+        
+        return RetrievalResult(
+            documents=docs,
+            scores=scores,
+            retrieval_method="semantic",
+            query_expansion=query_analysis.expansion_terms,
+            total_candidates=len(docs)
+        )
+    
+    def _keyword_search(self, query_analysis: QueryAnalysis) -> RetrievalResult:
+        """Perform keyword search"""
+        # Use keywords and entities for BM25 search
+        keyword_query = " ".join(query_analysis.keywords + query_analysis.entities)
+        
+        docs = self.keyword_retriever.get_relevant_documents(keyword_query)
+        
+        # BM25 doesn't provide scores directly, so we'll assign based on rank
+        scores = [1.0 / (i + 1) for i in range(len(docs))]
+        
+        return RetrievalResult(
+            documents=docs,
+            scores=scores,
+            retrieval_method="keyword",
+            total_candidates=len(docs)
+        )
+    
+    def _hybrid_search(self, query_analysis: QueryAnalysis) -> RetrievalResult:
+        """Perform hybrid search combining semantic and keyword results"""
+        # Get results from both retrievers
+        semantic_results = self._semantic_search(query_analysis)
+        keyword_results = self._keyword_search(query_analysis)
+        
+        # Combine results using reciprocal rank fusion
+        combined_docs, combined_scores = self._reciprocal_rank_fusion(
+            [(semantic_results.documents, semantic_results.scores, self.semantic_weight),
+             (keyword_results.documents, keyword_results.scores, self.keyword_weight)]
+        )
+        
+        return RetrievalResult(
+            documents=combined_docs,
+            scores=combined_scores,
+            retrieval_method="hybrid",
+            query_expansion=query_analysis.expansion_terms,
+            total_candidates=len(semantic_results.documents) + len(keyword_results.documents),
+            metadata={
+                "semantic_count": len(semantic_results.documents),
+                "keyword_count": len(keyword_results.documents)
+            }
+        )
+    
+    def _reciprocal_rank_fusion(
+        self, 
+        result_sets: List[Tuple[List[Document], List[float], float]]
+    ) -> Tuple[List[Document], List[float]]:
+        """Combine multiple result sets using reciprocal rank fusion"""
+        doc_scores = {}
+        doc_map = {}
+        
+        k = 60  # Constant for RRF
+        
+        for docs, scores, weight in result_sets:
+            for rank, (doc, score) in enumerate(zip(docs, scores)):
+                doc_id = doc.metadata.get("id", str(hash(doc.page_content)))
+                
+                if doc_id not in doc_scores:
+                    doc_scores[doc_id] = 0
+                    doc_map[doc_id] = doc
+                
+                # RRF score
+                rrf_score = weight * (1.0 / (k + rank + 1))
+                doc_scores[doc_id] += rrf_score
+        
+        # Sort by combined score
+        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        combined_docs = [doc_map[doc_id] for doc_id, _ in sorted_docs]
+        combined_scores = [score for _, score in sorted_docs]
+        
+        return combined_docs, combined_scores
+    
+    def _rerank_results(
+        self, 
+        results: RetrievalResult, 
+        query_analysis: QueryAnalysis
+    ) -> RetrievalResult:
+        """Rerank results based on query analysis and relevance signals"""
+        reranked_docs = []
+        reranked_scores = []
+        
+        for doc, base_score in zip(results.documents, results.scores):
+            # Calculate relevance boost factors
+            boost = 1.0
+            
+            # Boost if entities are found in the document
+            if query_analysis.entities:
+                entity_matches = sum(
+                    1 for entity in query_analysis.entities 
+                    if entity.lower() in doc.page_content.lower()
+                )
+                boost += 0.1 * entity_matches
+            
+            # Boost if keywords are found in the document
+            keyword_density = sum(
+                doc.page_content.lower().count(keyword) 
+                for keyword in query_analysis.keywords
+            ) / max(len(doc.page_content.split()), 1)
+            boost += min(keyword_density * 10, 0.3)
+            
+            # Boost based on metadata relevance
+            if query_analysis.query_type == "factual" and doc.metadata.get("type") == "reference":
+                boost += 0.2
+            elif query_analysis.query_type == "instructional" and doc.metadata.get("type") == "tutorial":
+                boost += 0.2
+            
+            # Apply temporal relevance if applicable
+            if query_analysis.temporal_context and doc.metadata.get("date"):
+                # Simple recency boost (in production, use proper date parsing)
+                boost += 0.1
+            
+            final_score = base_score * boost
+            reranked_docs.append(doc)
+            reranked_scores.append(final_score)
+        
+        # Sort by new scores
+        sorted_pairs = sorted(
+            zip(reranked_docs, reranked_scores), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        results.documents = [doc for doc, _ in sorted_pairs]
+        results.scores = [score for _, score in sorted_pairs]
+        results.metadata["reranked"] = True
+        
+        return results
+    
+    def _apply_diversity_filter(self, results: RetrievalResult) -> RetrievalResult:
+        """Apply diversity filtering to reduce redundancy"""
+        if len(results.documents) <= 1:
+            return results
+        
+        filtered_docs = [results.documents[0]]
+        filtered_scores = [results.scores[0]]
+        
+        for doc, score in zip(results.documents[1:], results.scores[1:]):
+            # Check similarity with already selected documents
+            is_diverse = True
+            
+            for selected_doc in filtered_docs:
+                similarity = self._calculate_similarity(doc.page_content, selected_doc.page_content)
+                if similarity > self.diversity_threshold:
+                    is_diverse = False
+                    break
+            
+            if is_diverse:
+                filtered_docs.append(doc)
+                filtered_scores.append(score)
+        
+        results.documents = filtered_docs
+        results.scores = filtered_scores
+        results.filtering_applied = True
+        
+        return results
+    
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate simple text similarity (Jaccard)"""
+        # In production, use better similarity metrics
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / max(len(union), 1)
+    
+    def _log_retrieval_metrics(self, query: str, results: RetrievalResult):
+        """Log detailed retrieval metrics"""
+        self.logger.info(
+            f"Retrieval complete: "
+            f"method={results.retrieval_method}, "
+            f"candidates={results.total_candidates}, "
+            f"results={len(results.documents)}, "
+            f"filtered={results.filtering_applied}, "
+            f"reranked={results.metadata.get('reranked', False)}"
+        )
+        
+
 class ChatAgent:
     """Enhanced chat agent with hybrid retrieval and advanced features"""
     
