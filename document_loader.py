@@ -474,35 +474,181 @@ class JSONLoader(BaseDocumentLoader):
 
 
 class WebPageLoader(BaseDocumentLoader):
+    """Web page loader with async HTTP requests and retry logic"""
+    
     def __init__(self, path: str, **kwargs):
         super().__init__(**kwargs)
         self.path = path
+        self.timeout = self.config.get("web_timeout", 10)
+        self.max_retries = 3
 
-    def load(self) -> List[Document]:
+    async def load_async(self) -> List[Document]:
+        """Load web pages asynchronously"""
+        self.logger.info(f"Starting async web content loading from {self.path}")
+        
+        all_docs = []
+        
+        # Process URL files
+        url_files = [f for f in os.listdir(self.path) if f.endswith(".txt")]
+        for file in url_files:
+            docs = await self._load_urls_from_file(os.path.join(self.path, file))
+            all_docs.extend(docs)
+        
+        # Process HTML files
+        html_files = [f for f in os.listdir(self.path) if f.endswith(".html")]
+        for file in html_files:
+            doc = await self._load_html_file(os.path.join(self.path, file))
+            if doc:
+                all_docs.append(doc)
+        
+        self.logger.info(f"Loaded {len(all_docs)} web documents")
+        return all_docs
+
+    async def _load_urls_from_file(self, file_path: str) -> List[Document]:
+        """Load URLs from a text file and fetch content"""
         docs = []
-        for file in os.listdir(self.path):
-            full_path = os.path.join(self.path, file)
-            if file.endswith(".txt"):  # each line is a URL
-                with open(full_path, "r") as f:
-                    for url in f.readlines():
-                        url = url.strip()
-                        try:
-                            html = requests.get(url, timeout=10).text
-                            text = self.extract_text(html)
-                            docs.append(Document(page_content=text, metadata={"source": url}))
-                        except Exception as e:
-                            print(f"⚠️ Failed to load {url}: {e}")
-            elif file.endswith(".html"):
-                with open(full_path, "r", encoding="utf-8") as f:
-                    html = f.read()
-                    text = self.extract_text(html)
-                    docs.append(Document(page_content=text, metadata={"source": file}))
+        
+        async with aiofiles.open(file_path, 'r') as f:
+            urls = [line.strip() for line in await f.readlines() if line.strip()]
+        
+        # Create aiohttp session for concurrent requests
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._fetch_url_async(session, url) for url in urls]
+            
+            # Process with progress bar
+            results = []
+            for coro in async_tqdm.as_completed(tasks, desc="Fetching URLs"):
+                result = await coro
+                if result:
+                    results.append(result)
+        
+        for url, content in results:
+            text = self.extract_text(content)
+            docs.append(Document(
+                page_content=text,
+                metadata={
+                    "source": url,
+                    "loader": "WebPageLoader",
+                    "fetch_time": datetime.utcnow().isoformat()
+                }
+            ))
+        
         return docs
 
-    def extract_text(self, html: str) -> str:
-        soup = BeautifulSoup(html, "html.parser")
-        return soup.get_text(separator="\n", strip=True)
+    async def _fetch_url_async(
+        self, 
+        session: aiohttp.ClientSession, 
+        url: str
+    ) -> Optional[Tuple[str, str]]:
+        """Fetch URL with retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                async with session.get(url, timeout=self.timeout) as response:
+                    response.raise_for_status()
+                    content = await response.text()
+                    return (url, content)
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    self.logger.error(f"Failed to fetch {url} after {self.max_retries} attempts: {e}")
+                    return None
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        
+        return None
 
+    async def _load_html_file(self, file_path: str) -> Optional[Document]:
+        """Load local HTML file"""
+        try:
+            self.security_validator.validate_file_path(file_path)
+            
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                html = await f.read()
+            
+            text = self.extract_text(html)
+            return Document(
+                page_content=text,
+                metadata={
+                    "source": file_path,
+                    "loader": "WebPageLoader",
+                    "file_name": os.path.basename(file_path)
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to load HTML file {file_path}: {e}")
+            return None
+
+    def extract_text(self, html: str) -> str:
+        """Extract clean text from HTML with better parsing"""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            
+            # Remove unwanted elements
+            for element in soup(["script", "style", "meta", "link", "noscript"]):
+                element.decompose()
+            
+            # Extract text with better formatting
+            text_parts = []
+            for element in soup.find_all(text=True):
+                text = element.strip()
+                if text and element.parent.name not in ["script", "style"]:
+                    text_parts.append(text)
+            
+            return "\n".join(text_parts)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract text from HTML: {e}")
+            return ""
+
+    def load(self) -> List[Document]:
+        """Synchronous loading interface"""
+        if self.enable_async:
+            return asyncio.run(self.load_async())
+        else:
+            return self._load_sync()
+
+    @retry_with_backoff(retries=3, exceptions=(requests.RequestException,))
+    def _fetch_url_sync(self, url: str) -> Optional[str]:
+        """Synchronous URL fetching with retry"""
+        response = requests.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        return response.text
+
+    def _load_sync(self) -> List[Document]:
+        """Traditional synchronous loading"""
+        docs = []
+        
+        # Process URL files
+        for file in os.listdir(self.path):
+            if file.endswith(".txt"):
+                with open(os.path.join(self.path, file), 'r') as f:
+                    urls = [line.strip() for line in f.readlines() if line.strip()]
+                
+                for url in urls:
+                    try:
+                        html = self._fetch_url_sync(url)
+                        if html:
+                            text = self.extract_text(html)
+                            docs.append(Document(
+                                page_content=text,
+                                metadata={"source": url, "loader": "WebPageLoader"}
+                            ))
+                    except Exception as e:
+                        self.logger.error(f"Failed to fetch {url}: {e}")
+            
+            elif file.endswith(".html"):
+                file_path = os.path.join(self.path, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        html = f.read()
+                    text = self.extract_text(html)
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={"source": file_path, "loader": "WebPageLoader"}
+                    ))
+                except Exception as e:
+                    self.logger.error(f"Failed to load {file}: {e}")
+        
+        return docs
+    
 
 class SmartDocumentLoader(BaseDocumentLoader):
     def __init__(self, config_path: str = "config.yaml", config: dict = None):
