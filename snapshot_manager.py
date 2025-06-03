@@ -1,163 +1,244 @@
 import os
 import json
 import uuid
-from datetime import datetime, timezone
-from typing import List, Dict, Optional
-from langchain.schema import AIMessage, HumanMessage
-from langchain.memory import ConversationBufferMemory
+import gzip
+import shutil
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional, Any, Tuple
+from pathlib import Path
+from dataclasses import dataclass, asdict
+import asyncio
+
+from langchain.schema import AIMessage, HumanMessage, BaseMessage
+from langchain.memory import ConversationBufferMemory, ConversationSummaryBufferMemory
+from langchain_core.language_models import BaseLLM
+from langchain_core.language_models.chat_models import BaseChatModel
+
+# Import from enhanced utils
+from utils import (
+    setup_logging, handle_errors, time_operation, ensure_directory,
+    get_file_info, performance_monitor
+)
+from monitoring import get_monitoring_instance
+
+
+@dataclass
+class ConversationTurn:
+    """Single turn in a conversation"""
+    question: str
+    answer: str
+    sources: List[Dict[str, Any]]
+    timestamp: datetime
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class SessionMetadata:
+    """Enhanced session metadata"""
+    session_id: str
+    alias: str
+    created: datetime
+    modified: datetime
+    file_path: str
+    total_turns: int = 0
+    total_tokens: int = 0
+    summary_available: bool = False
+    compressed: bool = False
+    size_bytes: int = 0
+    model_used: Optional[str] = None
+    tags: List[str] = None
+    
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
 
 
 class SnapshotManager:
-    def __init__(self, snapshot_dir: str = "./snapshots"):
-        self.snapshot_dir = snapshot_dir
-        self.session_dir = os.path.join(snapshot_dir, "sessions")
-        self.metadata_dir = os.path.join(snapshot_dir, "metadata")
-        os.makedirs(self.session_dir, exist_ok=True)
-        os.makedirs(self.metadata_dir, exist_ok=True)
-        self.alias_file = os.path.join(self.metadata_dir, "aliases.json")
-        self.session_file = os.path.join(self.metadata_dir, "sessions.json")
+    """Enhanced snapshot manager with conversation summarization and compression"""
+    
+    def __init__(
+        self, 
+        snapshot_dir: str = "./snapshots",
+        llm: Optional[BaseLLM] = None,
+        config: Dict[str, Any] = None
+    ):
+        self.snapshot_dir = Path(snapshot_dir)
+        self.session_dir = self.snapshot_dir / "sessions"
+        self.metadata_dir = self.snapshot_dir / "metadata"
+        self.summary_dir = self.snapshot_dir / "summaries"
         
+        # Create directories
+        for dir_path in [self.session_dir, self.metadata_dir, self.summary_dir]:
+            ensure_directory(dir_path)
+        
+        # File paths
+        self.alias_file = self.metadata_dir / "aliases.json"
+        self.session_file = self.metadata_dir / "sessions.json"
+        
+        # Configuration
+        self.config = config or {}
+        memory_config = self.config.get("memory", {})
+        self.max_turns_before_summary = memory_config.get("max_turns_before_summary", 20)
+        self.summary_token_limit = memory_config.get("summary_token_limit", 500)
+        self.compression_enabled = memory_config.get("enable_compression", True)
+        self.auto_cleanup_days = memory_config.get("auto_cleanup_days", 30)
+        
+        # Setup logging
+        log_config = self.config.get("logging", {})
+        self.logger = setup_logging(
+            name="rag_chat.SnapshotManager",
+            log_level=log_config.get("level", "INFO"),
+            log_file=log_config.get("file_path"),
+            console_level=log_config.get("console_level")
+        )
+        
+        # LLM for summarization
+        self.llm = llm
+        
+        # Load metadata
         self.alias_map = self._load_json(self.alias_file)
         self.sessions_meta = self._load_json(self.session_file)
         
+        # Initialize monitoring
+        self.metrics = get_monitoring_instance(config)
+        
+        # Current session state
         self.session_id = None
         self.session_path = None
         self.history = []
-        self.metadata = {}
+        self.metadata = None
+        self.memory = None
         
-    def _load_json(self, path: str) -> dict:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
+        # Perform cleanup on initialization
+        self._cleanup_old_sessions()
+        
+        self.logger.info(f"SnapshotManager initialized with {len(self.sessions_meta)} sessions")
+    
+    def _load_json(self, path: Path) -> dict:
+        """Load JSON file with error handling"""
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.error(f"Failed to load {path}: {e}")
+                return {}
         return {}
-
-    def _save_json(self, path: str, data: dict):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-            
-    def start_new_session(self, alias: Optional[str] = None) -> str:
+    
+    def _save_json(self, path: Path, data: dict):
+        """Save JSON file with error handling"""
+        try:
+            ensure_directory(path.parent)
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            self.logger.error(f"Failed to save {path}: {e}")
+    
+    @handle_errors(logger=None, raise_on_error=True)
+    def start_new_session(
+        self, 
+        alias: Optional[str] = None,
+        model_name: Optional[str] = None,
+        tags: List[str] = None
+    ) -> str:
+        """Start a new conversation session"""
         self.session_id = str(uuid.uuid4())
-        self.session_path = os.path.join(self.session_dir, f"{self.session_id}.json")
+        self.session_path = self.session_dir / f"{self.session_id}.json"
         self.history = []
         
-        now = datetime.now(timezone.utc).isoformat()
-        alias = alias or self.session_id
-
-        self.metadata = {
-            "session_id": self.session_id,
-            "alias": alias,
-            "created": now,
-            "modified": now,
-            "file": self.session_path
-        }
+        now = datetime.now(timezone.utc)
+        alias = alias or f"session_{now.strftime('%Y%m%d_%H%M%S')}"
         
-        #self.sessions_meta[self.session_id] = self.metadata
-        #self.alias_map[alias] = self.session_id
-        #self._save_json(self.session_file, self.sessions_meta)
-        #self._save_json(self.alias_file, self.alias_map)
+        self.metadata = SessionMetadata(
+            session_id=self.session_id,
+            alias=alias,
+            created=now,
+            modified=now,
+            file_path=str(self.session_path),
+            model_used=model_name,
+            tags=tags or []
+        )
+        
+        # Initialize memory (will be upgraded to summary memory if needed)
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        
+        self.logger.info(f"Started new session: {self.session_id} (alias: {alias})")
+        
+        # Record metrics
+        self.metrics.record_metric("session_started", 1.0)
         
         return self.session_id
-
-    def resume_session(self, identifier: str) -> Optional[ConversationBufferMemory]:
+    
+    @time_operation("session_resume")
+    def resume_session(
+        self, 
+        identifier: str,
+        load_summary: bool = True
+    ) -> Optional[ConversationBufferMemory]:
+        """Resume an existing session"""
+        # Resolve alias to session ID
         session_id = self.alias_map.get(identifier, identifier)
-        meta = self.sessions_meta.get(session_id)
-
-        if not meta:
-            print("❌ Session not found.")
+        meta_dict = self.sessions_meta.get(session_id)
+        
+        if not meta_dict:
+            self.logger.error(f"Session not found: {identifier}")
             return None
+        
+        # Convert dict to SessionMetadata
+        meta = self._dict_to_metadata(meta_dict)
         
         self.session_id = session_id
-        self.session_path = meta["file"]
+        self.session_path = Path(meta.file_path)
         self.metadata = meta
-
-        if not os.path.exists(self.session_path):
-            print("❌ Session file missing.")
+        
+        # Check if file exists
+        file_path = self.session_path
+        if meta.compressed:
+            file_path = Path(str(self.session_path) + ".gz")
+        
+        if not file_path.exists():
+            self.logger.error(f"Session file missing: {file_path}")
             return None
-
+        
         try:
-            with open(self.session_path, "r") as f:
-                data = json.load(f)
-                self.history = data.get("history", [])
-        except Exception:
-            print("⚠️ Failed to load session history.")
-            return None
-
-        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        
-        for item in self.history:
-            memory.chat_memory.add_user_message(HumanMessage(content=item["question"]))
-            memory.chat_memory.add_ai_message(AIMessage(content=item["answer"]))
-        
-        return memory
-    
-    def resume_latest(self) -> Optional[ConversationBufferMemory]:
-        sessions = self.list_sessions()
-        if not sessions:
-            print("❌ No sessions found.")
-            return None
-        return self.resume_session(sessions[0]["id"])
-    
-    def list_sessions(self) -> List[Dict]:
-        sessions = []
-        for sid, meta in self.sessions_meta.items():
-            try:
-                created = meta.get("created")
-                modified = meta.get("modified")
-                alias = meta.get("alias", sid)
-                file_path = meta.get("file")
-                
-                if os.path.exists(file_path):
-                    with open(file_path, "r") as f:
-                        data = json.load(f)
-                    history = data.get("history", [])
-                    first_msg = history[0]["question"] if history else ""
-                else:
-                    first_msg = "(missing session file)"
-
-            except Exception:
-                created = modified = None
-                alias = sid
-                first_msg = "(corrupt or empty)"
-                
-            sessions.append({
-                "id": sid,
-                "alias": alias,
-                "created": created,
-                "modified": modified,
-                "first_msg": first_msg
-            })
-                
-        def sort_key(s):
-            return s.get("modified") or s.get("created")
-  
-        return sorted(sessions, key=sort_key, reverse=True)
-
-    def record_turn(self, question: str, answer: str, sources: List[Dict]):
-        self.history.append({
-            "question": question,
-            "answer": answer,
-            "sources": sources
-        })
-
-    def save_snapshot(self):
-        if not self.session_path:
-            self.session_path = os.path.join(self.session_dir, f"{self.session_id}.json")
-
-        self.metadata["modified"] = datetime.now(timezone.utc).isoformat()
-        data = {
-            "metadata": self.metadata,
-            "history": self.history
-        }
-
-        with open(self.session_path, "w") as f:
-            json.dump(data, f, indent=2)
+            # Load session data
+            session_data = self._load_session_file(file_path)
+            self.history = session_data.get("history", [])
             
-        self.sessions_meta[self.session_id] = self.metadata
-        self.alias_map[self.metadata["alias"]] = self.session_id
-        self._save_json(self.session_file, self.sessions_meta)
-        self._save_json(self.alias_file, self.alias_map)
-
-        # Update metadata record
-        self.sessions_meta[self.session_id] = self.metadata
-        self._save_json(self.session_file, self.sessions_meta)
-        print(f"💾 Snapshot saved to: {self.session_path}")
+            # Create memory
+            if load_summary and meta.summary_available and self.llm:
+                memory = self._load_with_summary(session_id, self.history)
+            else:
+                memory = self._load_without_summary(self.history)
+            
+            self.memory = memory
+            
+            self.logger.info(
+                f"Resumed session {session_id} with {len(self.history)} turns"
+                f"{' (with summary)' if load_summary and meta.summary_available else ''}"
+            )
+            
+            # Record metrics
+            self.metrics.record_metric("session_resumed", 1.0)
+            
+            return memory
+            
+        except Exception as e:
+            self.logger.error(f"Failed to resume session: {e}")
+            return None
+    
+    def _load_session_file(self, file_path: Path) -> Dict[str, Any]:
+        """Load session file, handling compression"""
+        if str(file_path).endswith(".gz"):
+            with gzip.open(file_path, "rt") as f:
+                return json.load(f)
+        else:
+            with open(file_path, "r") as f:
+                return json.load(f)
