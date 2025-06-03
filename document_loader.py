@@ -651,21 +651,191 @@ class WebPageLoader(BaseDocumentLoader):
     
 
 class SmartDocumentLoader(BaseDocumentLoader):
+    """Smart loader with automatic format detection and optimized loading"""
+    
     def __init__(self, config_path: str = "config.yaml", config: dict = None):
         super().__init__(config_path=config_path, config=config)
         self.path = self.config.get("data_path", "./data")
+        
+        # Validate data directory
+        try:
+            ensure_directory(self.path)
+            if self.security_validator:
+                self.security_validator.validate_file_path(self.path)
+        except Exception as e:
+            self.logger.error(f"Invalid data path: {e}")
+            raise
+
+    async def load_async(self) -> List[Document]:
+        """Load documents asynchronously with intelligent routing"""
+        self.logger.info(f"Starting smart async document loading from {self.path}")
+        performance_monitor.start_timer("smart_loading")
+        
+        # Scan directory
+        file_types = self._scan_directory()
+        if not any(file_types.values()):
+            self.logger.warning(f"No supported documents found in {self.path}")
+            return []
+        
+        # Load different file types concurrently
+        tasks = []
+        
+        if file_types["pdf"]:
+            self.logger.info(f"Scheduling {len(file_types['pdf'])} PDF files")
+            tasks.append(self._load_pdfs_async())
+        
+        if file_types["json"]:
+            self.logger.info(f"Scheduling {len(file_types['json'])} JSON files")
+            tasks.append(self._load_json_files_async())
+        
+        if file_types["web"]:
+            self.logger.info(f"Scheduling {len(file_types['web'])} web sources")
+            tasks.append(self._load_web_content_async())
+        
+        # Execute all loaders concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Combine results
+        all_docs = []
+        for result in results:
+            if isinstance(result, Exception):
+                self.logger.error(f"Loader failed: {result}")
+            elif isinstance(result, list):
+                all_docs.extend(result)
+        
+        # Log performance metrics
+        loading_time = performance_monitor.end_timer("smart_loading")
+        self._log_final_statistics(all_docs, loading_time)
+        
+        return all_docs
+
+    async def _load_pdfs_async(self) -> List[Document]:
+        """Load PDFs asynchronously"""
+        loader = PDFLoader(self.path, config=self.config)
+        return await loader.load_async()
+
+    async def _load_json_files_async(self) -> List[Document]:
+        """Load JSON files asynchronously"""
+        loader = JSONLoader(self.path, config=self.config)
+        return await loader.load_async()
+
+    async def _load_web_content_async(self) -> List[Document]:
+        """Load web content asynchronously"""
+        loader = WebPageLoader(self.path, config=self.config)
+        return await loader.load_async()
 
     def load(self) -> List[Document]:
+        """Synchronous loading interface"""
+        if self.enable_async:
+            return asyncio.run(self.load_async())
+        else:
+            return self._load_sync()
+
+    @time_operation("smart_document_loading")
+    @handle_errors(logger=None, raise_on_error=True)
+    def _load_sync(self) -> List[Document]:
+        """Traditional synchronous loading with timing"""
+        self.logger.info(f"Starting smart document loading from {self.path}")
+        
+        if not os.path.exists(self.path):
+            raise DocumentProcessingError(
+                f"Data directory not found: {self.path}",
+                error_code="DATA_DIR_NOT_FOUND",
+                details={"path": self.path}
+            )
+        
+        # Scan directory
+        file_types = self._scan_directory()
+        if not any(file_types.values()):
+            self.logger.warning(f"No supported documents found in {self.path}")
+            return []
+        
         docs = []
-        file_types = os.listdir(self.path)
-        print(f"📄 Loaded {len(file_types)} documents from {self.path}")
-
-        if any(f.endswith(".pdf") for f in file_types):
-            docs.extend(PDFLoader(self.path, config=self.config).load())
-        if any(f.endswith(".json") for f in file_types):
-            docs.extend(JSONLoader(self.path, config=self.config).load())
-        if any(f.endswith((".txt", ".html")) for f in file_types):
-            docs.extend(WebPageLoader(self.path, config=self.config).load())
-
+        
+        # Load each type
+        if file_types["pdf"]:
+            try:
+                loader = PDFLoader(self.path, config=self.config)
+                docs.extend(loader.load())
+            except Exception as e:
+                self.logger.error(f"PDF loading failed: {e}")
+        
+        if file_types["json"]:
+            try:
+                loader = JSONLoader(self.path, config=self.config)
+                docs.extend(loader.load())
+            except Exception as e:
+                self.logger.error(f"JSON loading failed: {e}")
+        
+        if file_types["web"]:
+            try:
+                loader = WebPageLoader(self.path, config=self.config)
+                docs.extend(loader.load())
+            except Exception as e:
+                self.logger.error(f"Web loading failed: {e}")
+        
         return docs
+
+    def _scan_directory(self) -> Dict[str, List[str]]:
+        """Scan directory and categorize files"""
+        file_types = {"pdf": [], "json": [], "web": []}
+        
+        try:
+            for file in os.listdir(self.path):
+                if file.endswith(".pdf"):
+                    file_types["pdf"].append(file)
+                elif file.endswith(".json"):
+                    file_types["json"].append(file)
+                elif file.endswith((".txt", ".html")):
+                    file_types["web"].append(file)
+            
+            self.logger.debug(
+                f"Directory scan complete: "
+                f"{len(file_types['pdf'])} PDFs, "
+                f"{len(file_types['json'])} JSON files, "
+                f"{len(file_types['web'])} web sources"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Failed to scan directory: {e}")
+            raise DocumentProcessingError(
+                f"Directory scan failed: {self.path}",
+                error_code="SCAN_FAILED",
+                details={"path": self.path, "error": str(e)}
+            )
+        
+        return file_types
+
+    def _log_final_statistics(self, docs: List[Document], loading_time: float):
+        """Log comprehensive loading statistics"""
+        # Count by loader type
+        loader_counts = {}
+        total_size = 0
+        
+        for doc in docs:
+            loader = doc.metadata.get("loader", "Unknown")
+            loader_counts[loader] = loader_counts.get(loader, 0) + 1
+            
+            # Sum file sizes if available
+            if "file_size_mb" in doc.metadata:
+                total_size += doc.metadata["file_size_mb"]
+        
+        # Get system metrics
+        system_metrics = performance_monitor.get_system_metrics()
+        
+        self.logger.info(
+            f"\n{'='*60}\n"
+            f"Document Loading Complete:\n"
+            f"  Total documents: {len(docs)}\n"
+            f"  Loading time: {loading_time:.2f}s\n"
+            f"  Documents/second: {len(docs)/loading_time:.2f}\n"
+            f"  Total size: {total_size:.2f}MB\n"
+            f"\nBreakdown by loader:\n" +
+            "\n".join([f"  - {loader}: {count}" for loader, count in loader_counts.items()]) +
+            f"\n\nSystem metrics:\n"
+            f"  CPU usage: {system_metrics['cpu_percent']}%\n"
+            f"  Memory usage: {system_metrics['memory']['percent']}%\n"
+            f"  Available memory: {system_metrics['memory']['available_gb']:.2f}GB\n"
+            f"{'='*60}"
+        )
 
