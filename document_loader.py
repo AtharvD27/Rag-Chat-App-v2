@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
-from tqdm.asyncio import tqdm as async_tqdm
+from tqdm.asyncio import tqdm_asyncio as async_tqdm
 from tqdm import tqdm
 from langchain.docstore.document import Document
 from langchain.document_loaders import PyPDFLoader
@@ -70,9 +70,13 @@ class BaseDocumentLoader(ABC):
         )
 
         # Security validator
-        self.security_validator = self.config.get("_security_validator")
-        if not self.security_validator:
-            self.security_validator = SecurityValidator(self.config.get("security", {}))
+        security_config = self.config.get("security", {
+            "allowed_file_types": [".pdf", ".txt", ".json", ".html"],
+            "max_file_size_mb": 100,
+            "allowed_directories": ["./data"],
+            "enable_content_scanning": True
+        })
+        self.security_validator = SecurityValidator(security_config)
         
         # Statistics tracking
         self.stats = LoaderStats()
@@ -93,7 +97,12 @@ class BaseDocumentLoader(ABC):
                 return {
                     "chunk": {"size": 800, "overlap": 80},
                     "logging": {"level": "INFO"},
-                    "performance": {"batch_size": 100, "max_concurrent_operations": 4}
+                    "performance": {"batch_size": 100, "max_concurrent_operations": 4},
+                    "security": {
+                        "allowed_file_types": [".pdf", ".txt", ".json", ".html"],
+                        "max_file_size_mb": 100,
+                        "allowed_directories": ["./data"]
+                    }
                 }
 
     @abstractmethod
@@ -106,7 +115,37 @@ class BaseDocumentLoader(ABC):
         """Sync document loading - must be implemented by subclasses"""
         pass
 
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        """Split documents into chunks (sync wrapper)"""
+        if self.enable_async:
+            return asyncio.run(self.split_documents_async(documents))
+        else:
+            return self._split_documents_sync(documents)
+
+    @time_operation("document_splitting_sync")
+    @handle_errors(logger=None, raise_on_error=True)
+    def _split_documents_sync(self, documents: List[Document]) -> List[Document]:
+        """Synchronous document splitting"""
+        self.logger.info(f"Splitting {len(documents)} documents into chunks")
+        
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap
+        )
+        
+        all_chunks = []
+        
+        # Process in batches
+        for batch in batch_iterator(documents, self.batch_size):
+            chunks = splitter.split_documents(batch)
+            chunks = self.assign_chunk_ids(chunks)
+            all_chunks.extend(chunks)
+        
+        self.logger.info(f"Created {len(all_chunks)} chunks from {len(documents)} documents")
+        return all_chunks
+    
     @time_operation("document_splitting")
+    @handle_errors(logger=None, raise_on_error=True)
     async def split_documents_async(self, documents: List[Document]) -> List[Document]:
         """Split documents into chunks asynchronously with batch processing"""
         self.logger.info(f"Splitting {len(documents)} documents into chunks")
@@ -186,6 +225,8 @@ class PDFLoader(BaseDocumentLoader):
         super().__init__(**kwargs)
         self.path = path
 
+    @time_operation("pdf_loading_async")
+    @handle_errors(logger=None, raise_on_error=True)
     async def load_async(self) -> List[Document]:
         """Load PDFs asynchronously with progress tracking"""
         self.logger.info(f"Starting async PDF loading from {self.path}")
@@ -203,11 +244,13 @@ class PDFLoader(BaseDocumentLoader):
             )
         
         # Get all PDF files
-        pdf_files = [f for f in os.listdir(self.path) if f.endswith(".pdf")]
-        self.stats.total_files = len(pdf_files)
-        
-        if not pdf_files:
-            self.logger.warning(f"No PDF files found in {self.path}")
+        pdf_files = []
+        try:
+            for f in os.listdir(self.path):
+                if f.endswith(".pdf"):
+                    pdf_files.append(f)
+        except Exception as e:
+            self.logger.error(f"Failed to list files in {self.path}: {e}")
             return []
         
         # Process PDFs concurrently
@@ -215,24 +258,28 @@ class PDFLoader(BaseDocumentLoader):
         
         async def process_pdf(file: str) -> Optional[List[Document]]:
             async with semaphore:
-                return await self._load_single_pdf_async(os.path.join(self.path, file))
+                result = await self._load_single_pdf_async(os.path.join(self.path, file))
+                if result is None:
+                    self.stats.failed_files += 1
+                else:
+                    self.stats.successful_files += 1
+                return result
         
         # Process with progress bar
         tasks = [process_pdf(file) for file in pdf_files]
         results = []
-        
+
         with tqdm(total=len(pdf_files), desc="Loading PDFs") as pbar:
             for coro in asyncio.as_completed(tasks):
                 result = await coro
-                if result:
-                    results.extend(result)
+                results.append(result)
                 pbar.update(1)
-        
-        # Flatten results
+
+        # Flatten results - handle None results properly
         all_docs = []
-        for docs in results:
-            if docs:
-                all_docs.extend(docs)
+        for result in results:
+            if result:
+                all_docs.extend(result)
         
         # Update statistics
         self.stats.processing_time = performance_monitor.end_timer("pdf_loading")
@@ -242,6 +289,8 @@ class PDFLoader(BaseDocumentLoader):
         self._log_statistics()
         return all_docs
 
+    @time_operation("single_pdf_load")
+    @handle_errors(logger=None, raise_on_error=False)  # Don't raise, return None
     async def _load_single_pdf_async(self, file_path: str) -> Optional[List[Document]]:
         """Load a single PDF file asynchronously"""
         try:
@@ -292,6 +341,8 @@ class PDFLoader(BaseDocumentLoader):
         else:
             return self._load_sync()
 
+    @time_operation("pdf_loading_sync")
+    @handle_errors(logger=None, raise_on_error=True)
     def _load_sync(self) -> List[Document]:
         """Traditional synchronous loading"""
         self.logger.info(f"Loading PDFs from {self.path}")
@@ -338,12 +389,15 @@ class JSONLoader(BaseDocumentLoader):
         super().__init__(**kwargs)
         self.path = path
 
+    @time_operation("json_loading_async")
+    @handle_errors(logger=None, raise_on_error=True)
     async def load_async(self) -> List[Document]:
         """Load JSON files asynchronously with streaming for large files"""
         self.logger.info(f"Starting async JSON loading from {self.path}")
         
-        json_files = [f for f in os.listdir(self.path) if f.endswith(".json")]
-        if not json_files:
+        try:
+            json_files = [f for f in os.listdir(self.path) if f.endswith(".json")]
+        except Exception as e:
             self.logger.warning(f"No JSON files found in {self.path}")
             return []
         
@@ -384,27 +438,43 @@ class JSONLoader(BaseDocumentLoader):
         
         return self._process_json_data(data, file_path)
 
+    @time_operation("large_json_load")
+    @handle_errors(logger=None, raise_on_error=False)
     async def _load_large_json_async(self, file_path: str) -> List[Document]:
         """Stream large JSON files to avoid memory issues"""
-        self.logger.info(f"Streaming large JSON file: {file_path}")
+        self.logger.info(f"Processing large JSON file: {file_path}")
         docs = []
         
-        # For large files, we'll process in chunks
-        # This is a simplified approach - for production, consider using ijson
-        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-            content = await f.read()
-            data = json.loads(content)
-        
-        # Process in batches if it's a list
-        if isinstance(data, list):
-            for batch in batch_iterator(data, self.batch_size):
-                batch_docs = self._process_json_batch(batch, file_path)
-                docs.extend(batch_docs)
-        else:
-            docs = self._process_json_data(data, file_path)
-        
+        try:
+            # For truly large files, we should stream them
+            # For now, we'll just load in chunks if it's an array
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                first_char = await f.read(1)
+                await f.seek(0)
+                
+                if first_char == '[':
+                    # It's likely a JSON array - we can stream it
+                    content = await f.read()
+                    data = json.loads(content)
+                    
+                    # Process in batches
+                    for batch in batch_iterator(data, self.batch_size):
+                        batch_docs = self._process_json_batch(batch, file_path)
+                        docs.extend(batch_docs)
+                else:
+                    # It's likely a JSON object - load normally
+                    content = await f.read()
+                    data = json.loads(content)
+                    docs = self._process_json_data(data, file_path)
+                    
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON in file {file_path}: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to load large JSON {file_path}: {e}")
+    
         return docs
 
+    @handle_errors(logger=None, raise_on_error=False)
     def _process_json_data(self, data: Any, source: str) -> List[Document]:
         """Process JSON data into documents"""
         docs = []
@@ -434,7 +504,7 @@ class JSONLoader(BaseDocumentLoader):
         
         return docs
 
-    def _process_json_batch(self, batch: List[Any], source: str) -> List[Document]:
+    def _process_json_batch(self, batch: List[Any], source: str, start_idx: int = 0) -> List[Document]:
         """Process a batch of JSON entries"""
         docs = []
         for idx, entry in enumerate(batch):
@@ -444,7 +514,8 @@ class JSONLoader(BaseDocumentLoader):
                 metadata={
                     "source": source,
                     "loader": "JSONLoader",
-                    "batch_processed": True
+                    "batch_processed": True,
+                    "entry_index": start_idx + idx
                 }
             ))
         return docs
@@ -456,6 +527,8 @@ class JSONLoader(BaseDocumentLoader):
         else:
             return self._load_sync()
 
+    @time_operation("json_loading_sync")
+    @handle_errors(logger=None, raise_on_error=True)
     def _load_sync(self) -> List[Document]:
         """Traditional synchronous loading"""
         docs = []
@@ -482,9 +555,18 @@ class WebPageLoader(BaseDocumentLoader):
         self.timeout = self.config.get("web_timeout", 10)
         self.max_retries = 3
 
+    @time_operation("web_loading_async")
+    @handle_errors(logger=None, raise_on_error=True)
     async def load_async(self) -> List[Document]:
         """Load web pages asynchronously"""
         self.logger.info(f"Starting async web content loading from {self.path}")
+        
+        # Validate path
+        try:
+            self.security_validator.validate_file_path(self.path)
+        except Exception as e:
+            self.logger.error(f"Invalid path {self.path}: {e}")
+            return []
         
         all_docs = []
         
@@ -535,12 +617,15 @@ class WebPageLoader(BaseDocumentLoader):
         
         return docs
 
-    async def _fetch_url_async(
-        self, 
-        session: aiohttp.ClientSession, 
-        url: str
-    ) -> Optional[Tuple[str, str]]:
+    @time_operation("url_fetch")
+    @handle_errors(logger=None, raise_on_error=False)
+    async def _fetch_url_async(self, session: aiohttp.ClientSession, url: str) -> Optional[Tuple[str, str]]:
         """Fetch URL with retry logic"""
+
+        if not url.startswith(('http://', 'https://')):
+            self.logger.warning(f"Invalid URL scheme: {url}")
+            return None
+        
         for attempt in range(self.max_retries):
             try:
                 async with session.get(url, timeout=self.timeout) as response:
@@ -576,8 +661,12 @@ class WebPageLoader(BaseDocumentLoader):
             self.logger.error(f"Failed to load HTML file {file_path}: {e}")
             return None
 
+    @handle_errors(logger=None, raise_on_error=False)
     def extract_text(self, html: str) -> str:
         """Extract clean text from HTML with better parsing"""
+        if not html or not html.strip():
+            return ""
+        
         try:
             soup = BeautifulSoup(html, "html.parser")
             
@@ -592,11 +681,24 @@ class WebPageLoader(BaseDocumentLoader):
                 if text and element.parent.name not in ["script", "style"]:
                     text_parts.append(text)
             
-            return "\n".join(text_parts)
+            # Join with space to avoid concatenated words
+            text = " ".join(text_parts)
+            
+            # Clean up excessive whitespace
+            text = " ".join(text.split())
+            
+            return text
             
         except Exception as e:
             self.logger.error(f"Failed to extract text from HTML: {e}")
-            return ""
+            # Try basic text extraction as fallback
+            try:
+                # Remove obvious HTML tags
+                import re
+                text = re.sub('<[^<]+?>', ' ', html)
+                return " ".join(text.split())
+            except:
+                return ""
 
     def load(self) -> List[Document]:
         """Synchronous loading interface"""
@@ -612,6 +714,8 @@ class WebPageLoader(BaseDocumentLoader):
         response.raise_for_status()
         return response.text
 
+    @time_operation("web_loading_sync")
+    @handle_errors(logger=None, raise_on_error=True)
     def _load_sync(self) -> List[Document]:
         """Traditional synchronous loading"""
         docs = []
@@ -657,15 +761,14 @@ class SmartDocumentLoader(BaseDocumentLoader):
         super().__init__(config_path=config_path, config=config)
         self.path = self.config.get("data_path", "./data")
         
-        # Validate data directory
+        # Ensure directory exists
         try:
             ensure_directory(self.path)
-            if self.security_validator:
-                self.security_validator.validate_file_path(self.path)
         except Exception as e:
-            self.logger.error(f"Invalid data path: {e}")
-            raise
+            self.logger.error(f"Failed to create data directory {self.path}: {e}")
 
+    @time_operation("smart_loading_async")
+    @handle_errors(logger=None, raise_on_error=True)
     async def load_async(self) -> List[Document]:
         """Load documents asynchronously with intelligent routing"""
         self.logger.info(f"Starting smart async document loading from {self.path}")
@@ -694,14 +797,22 @@ class SmartDocumentLoader(BaseDocumentLoader):
         
         # Execute all loaders concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Combine results
+
+        # Combine results and track errors
         all_docs = []
-        for result in results:
+        loader_errors = []
+
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
-                self.logger.error(f"Loader failed: {result}")
+                loader_type = ["PDF", "JSON", "Web"][i] if i < 3 else "Unknown"
+                self.logger.error(f"{loader_type} loader failed: {result}")
+                loader_errors.append({"loader": loader_type, "error": str(result)})
             elif isinstance(result, list):
                 all_docs.extend(result)
+
+        # Add error summary to stats
+        if loader_errors:
+            self.stats.errors.extend(loader_errors)
         
         # Log performance metrics
         loading_time = performance_monitor.end_timer("smart_loading")
@@ -731,7 +842,7 @@ class SmartDocumentLoader(BaseDocumentLoader):
         else:
             return self._load_sync()
 
-    @time_operation("smart_document_loading")
+    @time_operation("smart_loading_sync")
     @handle_errors(logger=None, raise_on_error=True)
     def _load_sync(self) -> List[Document]:
         """Traditional synchronous loading with timing"""
@@ -776,20 +887,27 @@ class SmartDocumentLoader(BaseDocumentLoader):
         
         return docs
 
+    @handle_errors(logger=None, raise_on_error=True)
     def _scan_directory(self) -> Dict[str, List[str]]:
         """Scan directory and categorize files"""
         file_types = {"pdf": [], "json": [], "web": []}
         
         try:
             for file in os.listdir(self.path):
-                if file.endswith(".pdf"):
+                file_lower = file.lower()
+                
+                if file_lower.endswith(".pdf"):
                     file_types["pdf"].append(file)
-                elif file.endswith(".json"):
+                elif file_lower.endswith(".json"):
                     file_types["json"].append(file)
-                elif file.endswith((".txt", ".html")):
+                elif file_lower.endswith((".txt", ".html", ".htm")):
                     file_types["web"].append(file)
+                else:
+                    # Log skipped files
+                    if not file.startswith('.'):  # Ignore hidden files
+                        self.logger.debug(f"Skipping unsupported file: {file}")
             
-            self.logger.debug(
+            self.logger.info(
                 f"Directory scan complete: "
                 f"{len(file_types['pdf'])} PDFs, "
                 f"{len(file_types['json'])} JSON files, "
