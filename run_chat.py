@@ -1,21 +1,20 @@
 from typing import Dict, Any, List, Optional, Tuple, Union
 import asyncio
-from pathlib import Path
 
 from langchain.memory import ConversationBufferMemory
 from langchain_core.language_models import BaseLLM
 from langchain_core.language_models.chat_models import BaseChatModel
 
-# Import from enhanced modules
 from utils import (
     setup_logging, handle_errors, time_operation, performance_monitor
 )
 from vectorstore_manager import VectorstoreManager
-from chat_agent import ChatAgent, HybridRetriever
+from chat_agent import ChatAgent
 from snapshot_manager import SnapshotManager
 from get_llm import ModelManager, get_local_llm
 from document_loader import SmartDocumentLoader
 from monitoring import get_monitoring_instance
+from retriever_factory import RetrieverFactory
 
 
 class SessionOrchestrator:
@@ -85,9 +84,9 @@ def update_vectorstore(
     chunks: List, 
     skip_update: bool = False
 ) -> Any:
-    """Update vectorstore with enhanced manager"""
+    """Update vectorstore and create the appropriate retriever."""
     logger = setup_logging("rag_chat.update_vectorstore")
-    logger.info("Starting vectorstore update orchestration")
+    logger.info("Starting vectorstore and retriever setup orchestration")
     
     try:
         # Create vectorstore manager
@@ -108,26 +107,18 @@ def update_vectorstore(
             # Optimize after update
             vs_manager.optimize_index()
         else:
-            logger.info("Vectorstore is up to date")
+            logger.info("Vectorstore is up to date or update is skipped.")
         
-        # Create retriever based on configuration
-        retrieval_config = config.get("retrieval", {})
-        search_type = retrieval_config.get("search_type", "hybrid")
-        
-        if search_type == "hybrid":
-            logger.info("Creating hybrid retriever")
-            base_retriever = vs_manager.vs.as_retriever(
-                search_kwargs={"k": retrieval_config.get("top_k", 5) * 2}
-            )
-            # Note: In production, we'd pass the document list for BM25
-            # For now, return the base retriever with a note
-            retriever = base_retriever
-            logger.warning("Hybrid search requested but document list not available for BM25. Using semantic search only.")
-        else:
-            logger.info(f"Creating {search_type} retriever")
-            retriever = vs_manager.vs.as_retriever(
-                search_kwargs={"k": retrieval_config.get("top_k", 5)}
-            )
+        # --- MODIFIED BLOCK: Use the RetrieverFactory ---
+        logger.info("Initializing retriever factory to create the retriever...")
+        factory = RetrieverFactory(
+            vectorstore=vs_manager.vs,
+            documents=chunks,
+            config=config
+        )
+        retriever = factory.create_retriever()
+        logger.info(f"Successfully created retriever: {retriever.__class__.__name__}")
+        # --- END OF MODIFIED BLOCK ---
         
         # Record metrics
         metrics = get_monitoring_instance(config)
@@ -137,7 +128,7 @@ def update_vectorstore(
         return retriever
         
     except Exception as e:
-        logger.error(f"Vectorstore update failed: {e}")
+        logger.error(f"Vectorstore and retriever setup failed: {e}")
         raise
 
 
